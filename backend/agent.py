@@ -116,12 +116,15 @@ def runtime_enabled(config: Settings) -> list[str]:
     key = config.secret("orcarouter_api_key")
     if not key or len(key.strip()) < 12 or any(character.isspace() for character in key):
         raise AppError("CONFIGURATION", "ORCAROUTER_API_KEY érvénytelen.", 503)
-    if config.environment not in {"development", "test"}:
-        minimum = config.max_runtime_seconds * 1000 + CONSOLIDATION_TIMEOUT * 1000 + CLEANUP_TIMEOUT * 2000
-        if config.chat_deployment_max_request_ms < minimum:
-            raise AppError("DEPLOYMENT_UNSUPPORTED", "A telepítésnek támogatnia kell a hosszú feladatfuttatást.", 503)
+    sandbox_key = config.secret("instavm_api_key")
+    if sandbox_key is not None and (len(sandbox_key.strip()) < 12 or any(character.isspace() for character in sandbox_key)):
+        raise AppError("CONFIGURATION", "INSTAVM_API_KEY érvénytelen.", 503)
+    minimum = config.max_runtime_seconds * 1000 + CONSOLIDATION_TIMEOUT * 1000 + CLEANUP_TIMEOUT * 2000
+    if config.chat_deployment_max_request_ms < minimum:
+        raise AppError("DEPLOYMENT_UNSUPPORTED", "Hatórás feladatfuttatást támogató telepítés és megfelelő CHAT_DEPLOYMENT_MAX_REQUEST_MS érték szükséges.", 503)
+    config.validate_host_lists()
     enabled = list(TOOL_SPECS)
-    if not config.secret("instavm_api_key"):
+    if not sandbox_key:
         enabled = [name for name in enabled if name not in SANDBOX_TOOLS]
     elif not config.browser_hosts:
         enabled.remove("browse_url")

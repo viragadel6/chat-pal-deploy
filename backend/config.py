@@ -1,10 +1,27 @@
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from typing import Annotated
 
 from pydantic import Field, HttpUrl, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .errors import AppError
+
+HOST_RE = re.compile(r"^[a-z0-9.-]+$")
+
+
+def host_list(value: str, message: str) -> set[str]:
+    hosts: set[str] = set()
+    for item in value.split(","):
+        host = item.strip().lower()
+        if not host:
+            continue
+        if not HOST_RE.fullmatch(host) or host.startswith(".") or host.endswith(".") or ".." in host:
+            raise AppError("CONFIGURATION", message, 503)
+        hosts.add(host)
+    return hosts
 
 
 class Settings(BaseSettings):
@@ -65,11 +82,14 @@ class Settings(BaseSettings):
 
     @property
     def sandbox_domains(self) -> set[str]:
-        return {item.lower() for item in self.chat_sandbox_allowed_domains.split(",") if item}
+        return host_list(self.chat_sandbox_allowed_domains, "Érvénytelen sandbox gazdagép engedélylista.")
 
     @property
     def browser_hosts(self) -> set[str]:
-        return {item.lower() for item in self.chat_browser_allowed_hosts.split(",") if item}
+        return host_list(self.chat_browser_allowed_hosts, "Érvénytelen böngésző gazdagép engedélylista.")
+
+    def validate_host_lists(self) -> tuple[set[str], set[str]]:
+        return host_list(self.chat_sandbox_allowed_domains, "Érvénytelen sandbox gazdagép engedélylista."), host_list(self.chat_browser_allowed_hosts, "Érvénytelen böngésző gazdagép engedélylista.")
 
 
 @lru_cache
