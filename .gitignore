@@ -7,6 +7,7 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# Node leftovers
 node_modules
 dist
 dist-ssr
@@ -14,11 +15,11 @@ dist-ssr
 .vinxi
 .tanstack/**
 .nitro
-*.local
 
-# Wrangler / Cloudflare
-.wrangler/
+# Local environment and tooling
+*.local
 .dev.vars
+.wrangler/
 
 # Editor directories and files
 .vscode/*

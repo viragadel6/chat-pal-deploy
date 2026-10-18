@@ -10,12 +10,14 @@
 <!-- LOVABLE:END -->
 
 ## Decisions
-- tsconfig: noPropertyAccessFromIndexSignature and noUncheckedIndexedAccess disabled — imported chat.ts (982 lines) uses dot access on Record types throughout; relaxing two flags was chosen over rewriting 144 call sites.
-- Chat frontend is a static public/chat.html (395KB) that / redirects to; chat backend is src/routes/api/chat.ts (OrcaRouter + InstaVM).
-- Cognitive agent layer (dual-process planning, lifecycle phases, reflection, skill learning, distillation, playbook, operator messages) lives in src/lib/cognitive.server.ts and is loaded dynamically by the chat route; learned knowledge persists in Lovable Cloud agent_* tables accessed only server-side, keeping model-loop code and learning logic separate.
-- Forward provider reasoning and cognitive model output through reasoning_content SSE deltas, keeping cognitive output separate from the final answer so the existing thinking panel can display every emitted fragment.
-- Image requests use a multipart server route that keeps the external provider key server-side and forwards the provider response stream; the existing image dialog parses the provider's image results and requires a real reference image for edit models.
-- Background chat jobs run in the app's own /api/public/chat-worker route, started by a database HTTP call (pg_net) so the work survives browser closure; a 90s heartbeat lease lets reconnecting viewers restart a crashed job.
+- The application backend is a Python service in `backend/`; the previous TanStack Start server in `src/` was removed once the Python implementation covered the same HTTP and SSE contract.
+- The frontend stays a static `public/chat.html` (plus `public/chat-work.js` and `public/chat-work.css`) that the FastAPI app serves; `/` redirects to `/chat.html`.
+- The cognitive agent layer (dual-process planning, lifecycle phases, reflection, skill learning, distillation, playbook, operator messages) lives in `backend/app/agent/cognitive.py` and is loaded from the runtime module; learned knowledge persists in the `agent_*` tables accessed only server-side, keeping model-loop code and learning logic separate.
+- The agent loop lives in `backend/app/agent/runtime.py`; it owns deliberation, reflection, context compaction, browser control handoff, verification and consolidation, and it emits the durable `progress` / `delta` / `agent_event` / `error` / `terminal` / `done` event sequence.
+- Provider reasoning and cognitive model output travel through `reasoning_content` SSE deltas, keeping cognitive output separate from the final answer so the thinking panel can display every emitted fragment.
+- Image requests use a multipart route that keeps the external provider key server-side and forwards the provider response; the existing image dialog parses the provider results and requires a real reference image for edit models.
+- Background chat jobs run in the app's own `/api/public/chat-worker` route, started by a database HTTP call (`pg_net` through the `kick_chat_worker` RPC) so the work survives browser closure; a 90 s heartbeat lease lets reconnecting viewers restart a crashed job.
 - Live browser viewing uses direct CDP screenshot capture and input on a separate persistent canvas; database-backed browser control handoff pauses model tool steps across worker invocations before enabling human input.
-- Browser CDP commands use native WebSocket in a server-only module; the static chat loads a separate viewer script and stylesheet so transcript rendering cannot recreate the canvas.
+- Browser CDP commands use a native WebSocket client in `backend/app/agent/browser_cdp.py`; the static chat loads a separate viewer script and stylesheet so transcript rendering cannot recreate the canvas.
 - Work progress is emitted as a separate durable progress event, never as a preliminary model answer, so reconnects preserve actual execution status.
+- The TypeScript toolchain (bun, vite, drizzle, eslint, prettier) was removed together with the server sources; the database schema now lives in `supabase/migrations/` as plain SQL.
