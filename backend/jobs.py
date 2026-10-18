@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import logging
 import time
-import uuid
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -14,6 +13,9 @@ from .config import Settings
 from .db import Supabase, eq, gt, is_null, utc_now
 from .errors import AppError
 from .sse import event_frame
+
+PUBLISHED_ORIGIN = "https://chat-pal-deploy.lovable.app"
+logger = logging.getLogger("chat-pal.jobs")
 
 
 class JobSink:
@@ -53,20 +55,40 @@ class JobService:
         self.db = db
         self.tasks: set[asyncio.Task[Any]] = set()
 
-    def _track(self, task: asyncio.Task[Any]) -> None:
+    def _track(self, task: asyncio.Task[Any], job_id: str) -> None:
         self.tasks.add(task)
-        task.add_done_callback(self.tasks.discard)
+
+        def finish(completed: asyncio.Task[Any]) -> None:
+            self.tasks.discard(completed)
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            if error is not None:
+                logger.error("chat worker failure for %s: %s", job_id, error, exc_info=error)
+
+        task.add_done_callback(finish)
+
+    def _worker_origin(self, request_url: str) -> str | None:
+        parsed = urlparse(request_url)
+        hostname = (parsed.hostname or "").lower()
+        if not hostname or hostname in {"localhost", "127.0.0.1", "::1"} or self.config.environment in {"development", "test"}:
+            return None
+        if hostname.startswith("id-preview--"):
+            return PUBLISHED_ORIGIN
+        return f"{parsed.scheme}://{parsed.netloc}"
 
     async def dispatch(self, job_id: str, request_url: str) -> None:
-        parsed = urlparse(request_url)
-        if parsed.hostname in {"localhost", "127.0.0.1", None} or self.config.environment in {"development", "test"}:
-            self._track(asyncio.create_task(self.execute(job_id)))
+        origin = self._worker_origin(request_url)
+        if origin is None:
+            self._track(asyncio.create_task(self.execute(job_id)), job_id)
             return
-        origin = f"{parsed.scheme}://{parsed.netloc}"
         try:
             await self.db.rpc("kick_chat_worker", {"_base_url": origin, "_job_id": job_id})
-        except AppError:
-            self._track(asyncio.create_task(self.execute(job_id)))
+        except AppError as error:
+            if error.code in {"CONFIGURATION", "DATABASE_UNAVAILABLE", "DATABASE_FAILURE"}:
+                self._track(asyncio.create_task(self.execute(job_id)), job_id)
+                return
+            raise
 
     async def revive(self, job_id: str, request_url: str) -> None:
         job = await self.db.admin_single("chat_jobs", "status,lease_expires_at,stop_requested", [eq("id", job_id)])
@@ -112,6 +134,7 @@ class JobService:
         if not await self._claim(job):
             return {"status": "running"}
         cancellation = asyncio.Event()
+        started = time.monotonic()
         sink = JobSink(self.db, job_id)
         final_status = "failed"
         final_error: str | None = "A háttérmunka hibával leállt."
@@ -125,20 +148,21 @@ class JobService:
             outcome, reason, steps, calls = await agent.run()
             final_status = "completed" if outcome == "completed" else "cancelled" if outcome == "cancelled" else "failed"
             final_error = None if final_status != "failed" else reason
-            await sink.send({"type": "terminal", "task_id": job_id, "outcome": outcome, "reason": reason, "steps": steps, "tool_calls": calls, "duration_ms": 0})
+            await sink.send({"type": "terminal", "task_id": job_id, "outcome": outcome, "reason": reason, "steps": steps, "tool_calls": calls, "duration_ms": round((time.monotonic() - started) * 1000)})
             await sink.send({"type": "done", "task_id": job_id, "outcome": outcome})
         except AppError as error:
             final_status = "cancelled" if error.code == "CANCELLED" else "failed"
-            final_error = error.message
+            final_error = error.message if final_status == "failed" else None
             if final_status == "failed":
                 await sink.send({"type": "error", "task_id": job_id, "code": error.code, "message": error.message})
-            await sink.send({"type": "terminal", "task_id": job_id, "outcome": "cancelled" if final_status == "cancelled" else "failed", "reason": error.message, "steps": 0, "tool_calls": 0, "duration_ms": 0})
+            await sink.send({"type": "terminal", "task_id": job_id, "outcome": "cancelled" if final_status == "cancelled" else "failed", "reason": error.message, "steps": 0, "tool_calls": 0, "duration_ms": round((time.monotonic() - started) * 1000)})
             await sink.send({"type": "done", "task_id": job_id, "outcome": "cancelled" if final_status == "cancelled" else "failed"})
-        except Exception:
+        except Exception as error:
+            logger.error("chat worker crashed for %s: %s", job_id, error, exc_info=error)
             final_status = "failed"
             final_error = "A háttérmunka hibával leállt."
             await sink.send({"type": "error", "task_id": job_id, "code": "BACKGROUND_FAILURE", "message": final_error})
-            await sink.send({"type": "terminal", "task_id": job_id, "outcome": "failed", "reason": final_error, "steps": 0, "tool_calls": 0, "duration_ms": 0})
+            await sink.send({"type": "terminal", "task_id": job_id, "outcome": "failed", "reason": final_error, "steps": 0, "tool_calls": 0, "duration_ms": round((time.monotonic() - started) * 1000)})
             await sink.send({"type": "done", "task_id": job_id, "outcome": "failed"})
         finally:
             cancellation.set()
@@ -158,7 +182,8 @@ class JobService:
                     return
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as error:
+            logger.error("chat heartbeat failed for %s: %s", job_id, error, exc_info=error)
             cancellation.set()
 
     async def follow(self, job_id: str, after: int, request_url: str) -> AsyncIterator[bytes]:

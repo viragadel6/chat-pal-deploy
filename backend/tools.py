@@ -5,15 +5,13 @@ import base64
 import hashlib
 import ipaddress
 import json
-import os
 import random
 import re
 import socket
 import time
 import uuid
-from collections.abc import Awaitable, Callable
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import httpx
 
@@ -27,6 +25,10 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 MAX_FILE_BYTES = 131072
 MAX_PAGE_BYTES = 6000
 MAX_RESULT_BYTES = 12000
+MAX_PROVIDER_BYTES = 2097152
+MAX_FILE_CHUNK_BYTES = 65536
+EXECUTE_WAIT_MAX_SECONDS = 600
+CLEANUP_TIMEOUT = 12
 
 
 def require_string(values: dict[str, Any], name: str) -> str:
@@ -71,6 +73,8 @@ class Subagents:
                 await asyncio.sleep(2 ** attempt + random.random())
                 continue
             if response.is_success:
+                if len(response.content) > MAX_PROVIDER_BYTES:
+                    raise AppError("RESPONSE_TOO_LARGE", "A válasz meghaladja a bájthatárt.", 502)
                 try:
                     data = response.json()
                 except ValueError as error:
@@ -158,6 +162,8 @@ class CloudBrowser:
             raise AppError("CLOUD_BROWSER_FAILED", "A Browser Use szolgáltatás nem érhető el.", 502) from error
         if not response.is_success:
             raise AppError("CLOUD_BROWSER_FAILED", f"Browser Use HTTP {response.status_code}: {response.text[:500]}", 502)
+        if len(response.content) > MAX_PROVIDER_BYTES:
+            raise AppError("RESPONSE_TOO_LARGE", "A válasz meghaladja a bájthatárt.", 502)
         return response.json() if response.content else {}
 
     async def start(self, country: str, timeout_minutes: int) -> dict[str, Any]:
@@ -174,18 +180,18 @@ class CloudBrowser:
 
     async def stop(self, browser_id: str) -> dict[str, Any]:
         try:
-            await self._call(f"/{browser_id}", "PATCH", {"action": "stop"})
+            location = f"/{quote(browser_id, safe='')}"
+            await self._call(location, "PATCH", {"action": "stop"})
             self.owned.discard(browser_id)
-            recording_url: str | None = None
-            for _ in range(45):
-                state = await self._call(f"/{browser_id}", "GET")
+            deadline = time.monotonic() + 90
+            while time.monotonic() < deadline:
+                state = await self._call(location, "GET")
                 if isinstance(state.get("recordingUrl"), str):
-                    recording_url = state["recordingUrl"]
-                    break
+                    return {"status": "completed", "result": {"browser_id": browser_id, "stopped": True, "recording_url": state["recordingUrl"]}}
                 if state.get("recordingAvailable") is False:
-                    break
+                    return {"status": "completed", "result": {"browser_id": browser_id, "stopped": True, "recording_url": None}}
                 await asyncio.sleep(2)
-            return {"status": "completed", "result": {"browser_id": browser_id, "stopped": True, "recording_url": recording_url}}
+            return {"status": "completed", "result": {"browser_id": browser_id, "stopped": True, "recording_url": None, "message": "A felvétel még feldolgozás alatt van."}}
         except AppError as error:
             return {"status": "error", "result": {"code": error.code, "message": error.message}}
 
@@ -215,6 +221,34 @@ class CloudBrowser:
         raise AppError("CANCELLED", "A feladat megszakadt.", 499)
 
 
+READ_PAGE_SCRIPT = """import base64,json,os,sys
+p=sys.argv[1]
+o=int(sys.argv[2])
+with open(p,'rb') as f:
+ f.seek(o)
+ b=f.read({page})
+ size=f.seek(0,2)
+print(json.dumps({{'data_base64':base64.b64encode(b).decode('ascii'),'bytes_read':len(b),'next_offset':o+len(b),'eof':o+len(b)>=size,'total_bytes':size}}))"""
+
+
+CAPTURE_SCRIPT = """import base64,json,os,sys
+paths = sys.argv[1:]
+def read(location):
+ with open(location, "rb") as handle:
+  data = handle.read(2001)
+ size = os.path.getsize(location)
+ if len(data) > 2000:
+  data = data[:2000]
+ try:
+  text = data.decode("utf-8")
+ except UnicodeDecodeError:
+  text = ""
+ return text, base64.b64encode(data).decode("ascii"), size, size > len(data)
+left, left_encoded, left_size, left_cut = read(paths[0])
+right, right_encoded, right_size, right_cut = read(paths[1])
+print(json.dumps({"stdout": left, "stderr": right, "stdout_base64_preview": left_encoded, "stderr_base64_preview": right_encoded, "stdout_bytes": left_size, "stderr_bytes": right_size, "stdout_truncated": left_cut, "stderr_truncated": right_cut}))"""
+
+
 class Sandbox:
     def __init__(self, config: Settings, cancellation: asyncio.Event) -> None:
         self.config = config
@@ -225,6 +259,13 @@ class Sandbox:
         self.owned_sessions: set[str] = set()
         self.disposed = False
         self.created_at = time.monotonic()
+        self.deadline = time.monotonic() + config.max_runtime_seconds
+
+    def _remaining(self) -> None:
+        if self.cancellation.is_set():
+            raise AppError("CANCELLED", "A feladat megszakadt.", 499)
+        if time.monotonic() >= self.deadline:
+            raise AppError("RUNTIME_LIMIT", "A futásidő lejárt.", 408)
 
     async def close(self) -> None:
         if self.disposed:
@@ -233,12 +274,12 @@ class Sandbox:
         failures: list[str] = []
         if self.browser_id:
             try:
-                await self._api(f"/v1/browser/sessions/{self.browser_id}", "DELETE", None, timeout=12)
+                await self._api(f"/v1/browser/sessions/{self.browser_id}", "DELETE", None, timeout=CLEANUP_TIMEOUT, force=True)
             except AppError:
                 failures.append("browser")
         for session_id in self.owned_sessions:
             try:
-                await self._api("/kill", "POST", {"session_id": session_id}, timeout=12)
+                await self._api("/kill", "POST", {"session_id": session_id}, timeout=CLEANUP_TIMEOUT, force=True)
             except AppError:
                 failures.append(f"vm:{session_id}")
         await self.client.aclose()
@@ -251,8 +292,8 @@ class Sandbox:
             raise AppError("SANDBOX_DISABLED", "Az InstaVM eszközök le vannak tiltva.", 503)
         return key
 
-    async def _api(self, path: str, method: str, payload: dict[str, Any] | None, timeout: float = 45) -> dict[str, Any]:
-        if self.cancellation.is_set():
+    async def _api(self, path: str, method: str, payload: dict[str, Any] | None, timeout: float = 45, force: bool = False) -> dict[str, Any]:
+        if not force and self.cancellation.is_set():
             raise AppError("CANCELLED", "A feladat megszakadt.", 499)
         try:
             response = await self.client.request(method, f"{INSTAVM_URL}{path}", headers={"X-API-Key": self._key()}, json=payload, timeout=timeout)
@@ -268,6 +309,8 @@ class Sandbox:
             if 400 <= response.status_code < 500:
                 raise AppError("PROVIDER_REJECTED", f"A sandbox elutasította a kérést: HTTP {response.status_code}", 502)
             raise AppError("PROVIDER_HTTP", f"Sandbox HTTP {response.status_code}", 502)
+        if len(response.content) > MAX_PROVIDER_BYTES:
+            raise AppError("RESPONSE_TOO_LARGE", "A sandbox válasza meghaladja a bájthatárt.", 502)
         try:
             data = response.json() if response.content else {}
         except ValueError as error:
@@ -293,7 +336,8 @@ class Sandbox:
 
     async def _raw(self, command: str, timeout: int) -> dict[str, Any]:
         session_id = await self._session()
-        response = await self._api("/execute", "POST", {"session_id": session_id, "command": command, "language": "bash", "timeout": min(600, max(1, timeout))}, timeout=min(610, timeout + 10))
+        wait = min(EXECUTE_WAIT_MAX_SECONDS, max(1, int(timeout)))
+        response = await self._api("/execute", "POST", {"session_id": session_id, "command": command, "language": "bash", "timeout": wait}, timeout=(wait + 10) * 1.0)
         if response.get("success") is False or response.get("error"):
             raise AppError("PROVIDER_EXECUTION", "Az InstaVM végrehajtási hibát jelentett.", 502)
         return response
@@ -313,6 +357,15 @@ class Sandbox:
             raise AppError("PROTOCOL_ERROR", "Érvénytelen végrehajtási kilépési kód.", 502)
         return {"stdout": stdout[:marker_index], "stderr": stderr, "exit_code": int(code_text)}
 
+    async def _append_bytes(self, target: str, content: bytes) -> dict[str, int] | None:
+        destination = shell_quote(target)
+        for start in range(0, len(content), MAX_FILE_CHUNK_BYTES):
+            encoded = base64.b64encode(content[start : start + MAX_FILE_CHUNK_BYTES]).decode("ascii")
+            written = await self._checked(f"printf %s {shell_quote(encoded)} | base64 -d >> {destination}", 30)
+            if written["exit_code"] != 0:
+                return written
+        return None
+
     async def _write_bytes(self, path: str, content: bytes) -> dict[str, Any]:
         if len(content) > MAX_FILE_BYTES:
             raise AppError("INVALID_ARGUMENT", "A fájl bájtban túl nagy.", 400)
@@ -321,11 +374,9 @@ class Sandbox:
         if initialized["exit_code"] != 0:
             return {"status": "error", "result": initialized}
         try:
-            for start in range(0, len(content), 65536):
-                encoded = base64.b64encode(content[start : start + 65536]).decode("ascii")
-                written = await self._checked(f"printf %s {shell_quote(encoded)} | base64 -d >> {shell_quote(temporary)}", 30)
-                if written["exit_code"] != 0:
-                    return {"status": "error", "result": written}
+            transfer = await self._append_bytes(temporary, content)
+            if transfer is not None:
+                return {"status": "error", "result": transfer}
             digest = hashlib.sha256(content).hexdigest()
             checked = await self._checked(f"test \"$(wc -c < {shell_quote(temporary)})\" -eq {len(content)} && test \"$(sha256sum -- {shell_quote(temporary)} | cut -d ' ' -f 1)\" = {shell_quote(digest)} && mv -f -- {shell_quote(temporary)} {shell_quote(path)}", 30)
             if checked["exit_code"] != 0:
@@ -334,20 +385,88 @@ class Sandbox:
         finally:
             await self._checked(f"rm -f -- {shell_quote(temporary)}", 20)
 
+    async def background(self, script: str, interpreter: str, timeout_seconds: int) -> dict[str, Any]:
+        identifier = uuid.uuid4().hex
+        directory = f"/tmp/chat-job-{identifier}"
+        path = shell_quote(directory)
+        init = await self._checked(f"umask 077; mkdir -m 700 {path} && : > {path}/job", 30)
+        if init["exit_code"] != 0:
+            raise AppError("EXECUTION_FAILED", "A folyamatkönyvtár létrehozása sikertelen.", 502)
+        transfer = await self._append_bytes(f"{directory}/job", script.encode("utf-8"))
+        if transfer is not None:
+            raise AppError("EXECUTION_FAILED", "A távoli program átvitele sikertelen.", 502)
+        invocation = "bash -lc 'exec python3 \"$0\"' \"$1/job\"" if interpreter == "python" else "bash -l \"$1/job\""
+        runner = "\n".join((
+            "set -e",
+            f"chmod 600 {path}/job",
+            f"cat > {path}/runner.sh <<'CHAT_RUNNER'",
+            "set +e",
+            f"timeout --foreground --signal=TERM --kill-after=5s {timeout_seconds}s {invocation} > \"$1/stdout\" 2> \"$1/stderr\"",
+            "rc=$?",
+            "printf '%s\\n' \"$rc\" > \"$1/exit.tmp\"",
+            "mv \"$1/exit.tmp\" \"$1/exit\"",
+            "CHAT_RUNNER",
+            f"chmod 700 {path}/runner.sh",
+            f"setsid nohup bash {path}/runner.sh {path} </dev/null >/dev/null 2>&1 &",
+            f"printf '%s\\n' \"$!\" > {path}/pid",
+        ))
+        launch = await self._checked(runner, 30)
+        if launch["exit_code"] != 0:
+            raise AppError("EXECUTION_FAILED", "A folyamat indítása sikertelen.", 502)
+        limit = min(self.deadline, time.monotonic() + timeout_seconds + 10)
+        settled = False
+        try:
+            while True:
+                self._remaining()
+                sample = await self._checked(f"if test -f {path}/exit; then printf 'FINISHED\\n'; cat {path}/exit; else printf 'RUNNING\\n'; fi", 20)
+                if sample["exit_code"] != 0:
+                    raise AppError("EXECUTION_UNKNOWN", "A háttérfolyamat státusza nem olvasható.", 502)
+                if not sample["stdout"].startswith("FINISHED\n"):
+                    if time.monotonic() >= limit:
+                        raise AppError("EXECUTION_UNKNOWN", "A távoli folyamat nem zárult le ellenőrizhetően.", 504)
+                    await asyncio.sleep(min(1.0, max(0.0, limit - time.monotonic())))
+                    continue
+                value = sample["stdout"][9:].strip()
+                if not value.isdigit():
+                    raise AppError("PROTOCOL_ERROR", "Hibás folyamatkilépési kód.", 502)
+                status = int(value)
+                logs = await self._checked(f"python3 -c {shell_quote(CAPTURE_SCRIPT)} {path}/stdout {path}/stderr", 25)
+                if logs["exit_code"] != 0:
+                    raise AppError("EXECUTION_UNKNOWN", "A folyamatnapló nem olvasható.", 502)
+                try:
+                    details = json.loads(logs["stdout"])
+                except json.JSONDecodeError as error:
+                    raise AppError("PROTOCOL_ERROR", "Hibás folyamatnapló.", 502) from error
+                if not isinstance(details, dict) or any(key not in details for key in ("stdout", "stderr", "stdout_base64_preview", "stderr_base64_preview", "stdout_bytes", "stderr_bytes", "stdout_truncated", "stderr_truncated")):
+                    raise AppError("PROTOCOL_ERROR", "Hiányos folyamatnapló.", 502)
+                settled = True
+                return {
+                    "stdout": str(details["stdout"]),
+                    "stderr": str(details["stderr"]),
+                    "stdout_base64_preview": str(details["stdout_base64_preview"]),
+                    "stderr_base64_preview": str(details["stderr_base64_preview"]),
+                    "stdout_bytes": int(details["stdout_bytes"]),
+                    "stderr_bytes": int(details["stderr_bytes"]),
+                    "stdout_truncated": bool(details["stdout_truncated"]),
+                    "stderr_truncated": bool(details["stderr_truncated"]),
+                    "stdout_file": f"{directory}/stdout",
+                    "stderr_file": f"{directory}/stderr",
+                    "exit_code": status,
+                    "timed_out": status in {124, 137},
+                }
+        finally:
+            if not settled and self.session_id:
+                terminate = f'if test -f {path}/pid; then pid=$(cat {path}/pid); if kill -0 "$pid" 2>/dev/null; then kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true; fi; fi'
+                try:
+                    await self._api("/execute", "POST", {"session_id": self.session_id, "command": terminate, "language": "bash", "timeout": 10}, timeout=CLEANUP_TIMEOUT, force=True)
+                except AppError:
+                    pass
+
     async def exec(self, script: str, interpreter: str, timeout: int) -> dict[str, Any]:
         if timeout < 1 or timeout > 1800:
             raise AppError("INVALID_ARGUMENT", "A végrehajtási határidő érvénytelen.", 400)
-        path = f"/tmp/chat-job-{uuid.uuid4().hex}.script"
-        transferred = await self._write_bytes(path, script.encode("utf-8"))
-        if transferred["status"] != "completed":
-            return transferred
-        try:
-            command = f"timeout --signal=TERM --kill-after=5s {timeout}s {'python3' if interpreter == 'python' else 'bash -l'} {shell_quote(path)}"
-            result = await self._checked(command, min(timeout + 15, 1810))
-            result["timed_out"] = result["exit_code"] in {124, 137}
-            return {"status": "completed" if result["exit_code"] == 0 else "error", "result": result}
-        finally:
-            await self._checked(f"rm -f -- {shell_quote(path)}", 20)
+        result = await self.background(script, "python" if interpreter == "python" else "bash", timeout)
+        return {"status": "completed" if result["exit_code"] == 0 else "error", "result": result}
 
     async def install(self, packages: list[str]) -> dict[str, Any]:
         if not packages or len(packages) > 24 or any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.+-]{0,99}", item) for item in packages):
@@ -370,7 +489,7 @@ class Sandbox:
     async def read_file(self, path: str, offset: int) -> dict[str, Any]:
         if offset < 0:
             raise AppError("INVALID_ARGUMENT", "A fájl eltolása nemnegatív egész kell legyen.", 400)
-        script = "import base64,json,os,sys\np=sys.argv[1]\no=int(sys.argv[2])\nwith open(p,'rb') as f:\n f.seek(o)\n b=f.read(6000)\n size=f.seek(0,2)\nprint(json.dumps({'data_base64':base64.b64encode(b).decode('ascii'),'bytes_read':len(b),'next_offset':o+len(b),'eof':o+len(b)>=size,'total_bytes':size}))"
+        script = READ_PAGE_SCRIPT.format(page=MAX_PAGE_BYTES)
         response = await self._checked(f"python3 -c {shell_quote(script)} {shell_quote(path)} {offset}", 30)
         if response["exit_code"] != 0:
             return {"status": "error", "result": response}
@@ -378,7 +497,7 @@ class Sandbox:
             result = json.loads(response["stdout"])
         except json.JSONDecodeError as error:
             raise AppError("PROTOCOL_ERROR", "Hibás fájllapozási válasz.", 502) from error
-        if not isinstance(result, dict) or result.get("next_offset") != offset + result.get("bytes_read", -1):
+        if not isinstance(result, dict) or not isinstance(result.get("data_base64"), str) or not isinstance(result.get("bytes_read"), int) or not isinstance(result.get("next_offset"), int) or not isinstance(result.get("eof"), bool) or not isinstance(result.get("total_bytes"), int) or result["bytes_read"] > MAX_PAGE_BYTES or result["next_offset"] != offset + result["bytes_read"]:
             raise AppError("PROTOCOL_ERROR", "Érvénytelen fájllapozási válasz.", 502)
         return {"status": "completed", "result": result}
 

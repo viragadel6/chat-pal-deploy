@@ -2,31 +2,44 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import math
 import re
 import time
 import uuid
 from collections import defaultdict
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-from fastapi import FastAPI, File, Request, UploadFile
+from fastapi import FastAPI, Request
+from starlette.datastructures import UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
 from .cdp import browser_command
 from .config import Settings
-from .db import Supabase, eq, gt, in_values, utc_now
+from .db import Supabase, eq, in_values, utc_now
 from .errors import AppError
 from .jobs import JobService
-from .models import BrowserKeyInput, BrowserMouseInput, BrowserTextInput, BrowserWheelInput, ChatRequest
+from .cognitive import post_operator_message
+from .models import BrowserKeyInput, BrowserMouseInput, BrowserTextInput, BrowserWheelInput, validate_history
 from .sse import event_frame
 
+logger = logging.getLogger("chat-pal.api")
+
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
+JSON_CONTENT_TYPE = re.compile(r"^application/json(?:\s*;|\s*$)", re.IGNORECASE)
+CONVERSATION_ID_RE = re.compile(r"[0-9a-fA-F-]{36}")
+JOB_ID_RE = re.compile(r"[0-9a-fA-F-]{36}")
+INTEGER_RE = re.compile(r"^\s*[-+]?\d+")
 MAX_BODY = 1048576
+IMAGE_EDIT_ENDPOINT = "https://api.flymy.ai/api/v1/flymyai/gpt-image-2-5-sunburst_edit/predict"
 NO_STORE = {"Cache-Control": "private, no-store"}
 
 
@@ -80,9 +93,9 @@ def browser_error(message: str, status: int = 400, headers: dict[str, str] | Non
     return json_response({"error": message}, status, headers)
 
 
-async def read_json(request: Request, limit: int = MAX_BODY) -> Any:
+async def read_json(request: Request, limit: int = MAX_BODY, require_content_type: bool = True, invalid_message: str = "Hibás JSON vagy UTF-8 kérés.") -> Any:
     content_type = request.headers.get("content-type", "")
-    if not content_type.lower().startswith("application/json"):
+    if require_content_type and not JSON_CONTENT_TYPE.match(content_type):
         raise AppError("INVALID_REQUEST", "application/json szükséges.", 415)
     declared = request.headers.get("content-length")
     if declared and (not declared.isdigit() or int(declared) > limit):
@@ -93,7 +106,7 @@ async def read_json(request: Request, limit: int = MAX_BODY) -> Any:
     try:
         return json.loads(body.decode("utf-8", "strict"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise AppError("INVALID_REQUEST", "Hibás JSON vagy UTF-8 kérés.", 400) from error
+        raise AppError("INVALID_REQUEST", invalid_message, 400) from error
 
 
 def authorization_token(request: Request) -> str:
@@ -133,28 +146,27 @@ def verify_origin(request: Request, config: Settings) -> None:
         raise AppError("ORIGIN_DENIED", "Érvénytelen kérés eredete.", 403)
 
 
+def finite_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 def browser_input(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise AppError("INVALID_INPUT", "Érvénytelen bevitel.", 400)
+    kind = value.get("kind")
+    if kind not in {"mouse", "wheel", "key", "text"}:
+        raise AppError("INVALID_INPUT", "Érvénytelen bevitel.", 400)
+    if kind in {"mouse", "wheel"} and not (finite_number(value.get("x")) and finite_number(value.get("y"))):
+        raise AppError("INVALID_INPUT", "Érvénytelen bevitel.", 400)
+    model = {"mouse": BrowserMouseInput, "wheel": BrowserWheelInput, "key": BrowserKeyInput, "text": BrowserTextInput}[kind]
     try:
-        if not isinstance(value, dict):
-            raise ValueError("input")
-        kind = value.get("kind")
-        if kind == "mouse":
-            parsed = BrowserMouseInput.model_validate(value)
-            if not (0 <= parsed.x < 10000 and 0 <= parsed.y < 10000) or (parsed.type != "mouseMoved" and (parsed.button == "none" or parsed.clickCount < 1)):
-                raise ValueError("mouse")
-            return parsed.model_dump()
-        if kind == "wheel":
-            parsed = BrowserWheelInput.model_validate(value)
-            if not (0 <= parsed.x < 10000 and 0 <= parsed.y < 10000):
-                raise ValueError("wheel")
-            return parsed.model_dump()
-        if kind == "key":
-            return BrowserKeyInput.model_validate(value).model_dump()
-        if kind == "text":
-            return BrowserTextInput.model_validate(value).model_dump()
+        parsed = model.model_validate(value)
     except ValidationError as error:
         raise AppError("INVALID_INPUT", "Érvénytelen bevitel.", 400) from error
-    raise AppError("INVALID_INPUT", "Érvénytelen bevitel.", 400)
+    data = parsed.model_dump()
+    if kind == "mouse" and data["type"] != "mouseMoved" and (data["button"] == "none" or data["clickCount"] < 1):
+        raise AppError("INVALID_INPUT", "Érvénytelen bevitel.", 400)
+    return data
 
 
 def viewport_valid(input_data: dict[str, Any], width: int, height: int) -> bool:
@@ -168,11 +180,23 @@ def uuid_valid(value: str | None) -> bool:
 
 
 def app(config: Settings) -> FastAPI:
-    instance = FastAPI(title="Chat Pal Backend", docs_url=None, redoc_url=None, openapi_url=None)
     database = Supabase(config)
     jobs = JobService(config, database)
     limiter = RateLimiter()
     browser_state = BrowserState()
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            for task in list(jobs.tasks):
+                task.cancel()
+            if jobs.tasks:
+                await asyncio.gather(*jobs.tasks, return_exceptions=True)
+            await database.close()
+
+    instance = FastAPI(title="Chat Pal Backend", docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     instance.state.config = config
     instance.state.db = database
     instance.state.jobs = jobs
@@ -185,14 +209,6 @@ def app(config: Settings) -> FastAPI:
     async def validation_error_handler(_: Request, __: RequestValidationError) -> JSONResponse:
         return json_response({"error": {"code": "INVALID_REQUEST", "message": "Hibás kérés."}}, 400)
 
-    @instance.on_event("shutdown")
-    async def shutdown() -> None:
-        for task in list(jobs.tasks):
-            task.cancel()
-        if jobs.tasks:
-            await asyncio.gather(*jobs.tasks, return_exceptions=True)
-        await database.close()
-
     @instance.get("/healthz")
     async def healthz() -> Response:
         return Response(status_code=204)
@@ -201,42 +217,45 @@ def app(config: Settings) -> FastAPI:
     async def create_chat(request: Request) -> Response:
         try:
             raw = await read_json(request)
-            payload = ChatRequest.model_validate(raw)
-            if any(not item.content.strip() for item in payload.messages):
-                raise AppError("INVALID_REQUEST", "Az üzenet tartalma hibás vagy túl nagy.", 400)
-            if payload.messages[-1].role != "user":
-                raise AppError("INVALID_REQUEST", "A legutolsó üzenetnek felhasználói feladatnak kell lennie.", 400)
-            conversation_id = payload.conversation_id if uuid_valid(payload.conversation_id) else str(uuid.uuid4())
+            messages = [item.model_dump() for item in validate_history(raw)]
+            conversation_id = raw.get("conversation_id") if isinstance(raw, dict) else None
+            if not uuid_valid(conversation_id):
+                conversation_id = str(uuid.uuid4())
             job_id = str(uuid.uuid4())
-            messages = [item.model_dump() for item in payload.messages]
-            first_user = next((item.content for item in payload.messages if item.role == "user"), "Beszélgetés")
+            first_user = next((item["content"] for item in messages if item["role"] == "user"), "Beszélgetés")
             title = re.sub(r"\s+", " ", first_user).strip()[:80] or "Beszélgetés"
             now = utc_now()
-            await database.admin_upsert("chat_conversations", {"id": conversation_id, "title": title, "messages": messages, "updated_at": now}, "id", "minimal")
-            await database.admin_insert("chat_jobs", {"id": job_id, "conversation_id": conversation_id, "history": messages, "status": "queued", "created_at": now, "updated_at": now}, "minimal")
+            try:
+                await database.admin_upsert("chat_conversations", {"id": conversation_id, "title": title, "messages": messages, "updated_at": now}, "id", "minimal")
+            except AppError as error:
+                raise AppError("CONVERSATION_SAVE_FAILED", "A beszélgetés mentése sikertelen.", error.status_code if error.status_code >= 500 else 500) from error
+            try:
+                await database.admin_insert("chat_jobs", {"id": job_id, "conversation_id": conversation_id, "history": messages, "status": "queued", "created_at": now, "updated_at": now}, "minimal")
+            except AppError as error:
+                raise AppError("JOB_CREATE_FAILED", "A háttérmunka létrehozása sikertelen.", error.status_code if error.status_code >= 500 else 500) from error
             await jobs.dispatch(job_id, str(request.url))
             async def stream() -> AsyncIterator[bytes]:
                 yield event_frame({"type": "meta", "conversation_id": conversation_id, "job_id": job_id})
                 async for chunk in jobs.follow(job_id, 0, str(request.url)):
                     yield chunk
-            return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "private, no-store, no-cache, no-transform", "X-Accel-Buffering": "no", "X-Chat-Job-Id": job_id, "Connection": "keep-alive"})
-        except ValidationError:
-            return json_response({"error": {"code": "INVALID_REQUEST", "message": "Hiányzó vagy hibás üzenetlista."}}, 400)
+            return StreamingResponse(stream(), media_type="text/event-stream; charset=utf-8", headers={"Cache-Control": "private, no-store, no-cache, no-transform", "X-Accel-Buffering": "no", "X-Chat-Job-Id": job_id})
         except AppError as error:
             return error_response(error)
 
     @instance.get("/api/chat/jobs/{job_id}/events")
-    async def chat_events(job_id: str, request: Request, after: int = 0) -> Response:
-        if not uuid_valid(job_id):
+    async def chat_events(job_id: str, request: Request, after: str = "0") -> Response:
+        if not JOB_ID_RE.fullmatch(job_id):
             return browser_error("Érvénytelen munkaazonosító.", 400)
+        digits = INTEGER_RE.match(after)
+        cursor = max(0, int(digits.group(0))) if digits else 0
         async def stream() -> AsyncIterator[bytes]:
-            async for chunk in jobs.follow(job_id, max(0, after), str(request.url)):
+            async for chunk in jobs.follow(job_id, cursor, str(request.url)):
                 yield chunk
-        return StreamingResponse(stream(), media_type="text/event-stream", headers={"Cache-Control": "private, no-store, no-cache, no-transform", "X-Accel-Buffering": "no", "Connection": "keep-alive"})
+        return StreamingResponse(stream(), media_type="text/event-stream; charset=utf-8", headers={"Cache-Control": "private, no-store, no-cache, no-transform", "X-Accel-Buffering": "no", "Connection": "keep-alive"})
 
     @instance.post("/api/chat/jobs/{job_id}/stop")
     async def stop_chat(job_id: str) -> JSONResponse:
-        if not uuid_valid(job_id):
+        if not JOB_ID_RE.fullmatch(job_id):
             return browser_error("Érvénytelen munkaazonosító.", 400)
         job = await database.admin_single("chat_jobs", "id,status", [eq("id", job_id)])
         if not job:
@@ -250,9 +269,9 @@ def app(config: Settings) -> FastAPI:
     @instance.post("/api/chat/jobs/{job_id}/redirect")
     async def redirect_chat(job_id: str, request: Request) -> JSONResponse:
         try:
-            if not uuid_valid(job_id):
+            if not JOB_ID_RE.fullmatch(job_id):
                 return browser_error("Érvénytelen munkaazonosító.", 400)
-            raw = await read_json(request, 65536)
+            raw = await read_json(request, 65536, False, "Érvénytelen kérés.")
             message = raw.get("message", "") if isinstance(raw, dict) else ""
             if not isinstance(message, str) or not message.strip():
                 return browser_error("Üres üzenet nem küldhető.", 400)
@@ -263,30 +282,30 @@ def app(config: Settings) -> FastAPI:
                 return browser_error("A munka nem található.", 404)
             if job["status"] not in {"queued", "running"}:
                 return browser_error("A munka már lezárult, új irányt nem kaphat.", 409)
-            await database.admin_insert("agent_operator_messages", {"task_id": job_id, "content": message.strip(), "consumed": False}, "minimal")
+            await post_operator_message(database, job_id, message.strip())
             return json_response({"ok": True})
         except AppError as error:
-            return error_response(error)
+            return browser_error(error.message, error.status_code)
 
     @instance.post("/api/public/chat-worker")
     async def public_worker(request: Request) -> JSONResponse:
         try:
-            raw = await read_json(request, 16384)
+            raw = await read_json(request, 16384, False, "Érvénytelen kérés.")
             job_id = raw.get("job_id") if isinstance(raw, dict) else None
-            if not uuid_valid(job_id):
+            if not isinstance(job_id, str) or not JOB_ID_RE.fullmatch(job_id):
                 return browser_error("Érvénytelen munkaazonosító.", 400)
             result = await jobs.execute(job_id)
             return json_response(result)
         except AppError as error:
-            return error_response(error)
+            return browser_error(error.message, error.status_code)
 
     @instance.get("/api/conversations")
     async def conversations(ids: str = "") -> JSONResponse:
-        values = [item.strip() for item in ids.split(",") if uuid_valid(item.strip())][:100]
+        values = [item.strip() for item in ids.split(",") if CONVERSATION_ID_RE.fullmatch(item.strip())][:100]
         if not values:
             return json_response({"conversations": []})
         conversations_rows = await database.admin_select("chat_conversations", "id,title,messages,created_at,updated_at", [in_values("id", values)])
-        jobs_rows = await database.admin_select("chat_jobs", "id,conversation_id,status,response_content,response_reasoning,error,created_at,updated_at", [in_values("conversation_id", values)], order="created_at.desc", limit=1000)
+        jobs_rows = await database.admin_select("chat_jobs", "id,conversation_id,status,response_content,response_reasoning,error,created_at,updated_at", [in_values("conversation_id", values)], order="created_at.desc")
         latest: dict[str, dict[str, Any]] = {}
         for item in jobs_rows:
             latest.setdefault(str(item["conversation_id"]), item)
@@ -304,36 +323,53 @@ def app(config: Settings) -> FastAPI:
     @instance.post("/api/operator")
     async def operator(request: Request) -> JSONResponse:
         try:
-            raw = await read_json(request, 16384)
-            task_id = raw.get("task_id") if isinstance(raw, dict) else None
-            content = raw.get("content") if isinstance(raw, dict) else None
-            if not uuid_valid(task_id):
-                return browser_error("Hibás task_id.", 400)
-            if not isinstance(content, str) or not content.strip():
-                return browser_error("Üres üzenet.", 400)
-            await database.admin_insert("agent_operator_messages", {"task_id": task_id, "content": content.strip(), "consumed": False}, "minimal")
-            return json_response({"accepted": True})
+            raw = await read_json(request, 16384, False, "Hibás JSON.")
         except AppError as error:
-            return error_response(error)
+            return browser_error(error.message, error.status_code)
+        record = raw if isinstance(raw, dict) else {}
+        task_id = record.get("task_id")
+        content = record.get("content")
+        if not uuid_valid(task_id):
+            return browser_error("Hibás task_id.", 400)
+        if not isinstance(content, str) or not content.strip():
+            return browser_error("Üres üzenet.", 400)
+        try:
+            await post_operator_message(database, task_id, content.strip())
+        except AppError as error:
+            logger.error("operator message persistence failed for %s: %s", task_id, error.message)
+            return browser_error(error.message, 500)
+        return json_response({"accepted": True})
 
     @instance.post("/api/images/edits")
-    async def image_edit(request: Request, image: UploadFile = File(...), prompt: str = "", quality: str = "medium", size: str = "1024x1024") -> Response:
+    async def image_edit(request: Request) -> Response:
         key = config.secret("flymyai_api_key")
         if not key:
             return json_response({"message": "A FlyMyAI kulcs nincs beállítva."}, 503)
-        if not image.filename or not prompt.strip():
-            return json_response({"message": "Adj meg egy kiinduló képet és képleírást."}, 400)
-        content = await image.read()
-        if not content:
-            return json_response({"message": "A feltöltött kép üres."}, 400)
-        client = httpx.AsyncClient(timeout=httpx.Timeout(180, connect=30), follow_redirects=False)
-        files = {"image": (image.filename, content, image.content_type or "application/octet-stream")}
-        data = {"prompt": prompt, "quality": quality, "size": size}
         try:
-            upstream = await client.send(client.build_request("POST", "https://api.flymy.ai/api/v1/flymyai/gpt-image-2-5-sunburst_edit/predict", headers={"X-API-KEY": key}, files=files, data=data), stream=True)
+            form = await request.form()
+        except Exception:
+            return json_response({"message": "A képfeltöltés nem olvasható."}, 400)
+        image = form.get("image")
+        prompt = form.get("prompt")
+        if not isinstance(image, UploadFile) or not isinstance(prompt, str) or not prompt.strip():
+            return json_response({"message": "Adj meg egy kiinduló képet és képleírást."}, 400)
+        try:
+            payload = await image.read()
+        finally:
+            await image.close()
+        if not payload:
+            return json_response({"message": "Adj meg egy kiinduló képet és képleírást."}, 400)
+        quality = form.get("quality")
+        size = form.get("size")
+        client = httpx.AsyncClient(timeout=None, follow_redirects=False)
+        files = {"image": (image.filename or "image", payload, image.content_type or "application/octet-stream")}
+        data = {"prompt": prompt, "quality": quality if isinstance(quality, str) and quality else "medium", "size": size if isinstance(size, str) and size else "1024x1024"}
+        try:
+            upstream = await client.send(client.build_request("POST", IMAGE_EDIT_ENDPOINT, headers={"X-API-KEY": key}, files=files, data=data), stream=True)
         except httpx.HTTPError:
             await client.aclose()
             return json_response({"message": "A FlyMyAI nem érhető el; próbáld újra később."}, 502)
+
         async def stream() -> AsyncIterator[bytes]:
             try:
                 async for chunk in upstream.aiter_bytes():
@@ -341,6 +377,7 @@ def app(config: Settings) -> FastAPI:
             finally:
                 await upstream.aclose()
                 await client.aclose()
+
         return StreamingResponse(stream(), status_code=upstream.status_code, media_type=upstream.headers.get("content-type", "application/json"), headers={"Cache-Control": "no-store"})
 
     async def browser_auth(request: Request) -> tuple[str, str]:
@@ -391,7 +428,11 @@ def app(config: Settings) -> FastAPI:
                 return json_response({"id": session["id"], "control_mode": session["control_mode"], "status": session["status"]})
             if session["status"] != "active":
                 return json_response({"id": session["id"], "error": "A böngésző már leállt.", "control_mode": session["control_mode"], "status": session["status"]}, 409)
-            result = await browser_command(session["cdp_url"], "frame")
+            try:
+                result = await browser_command(session["cdp_url"], "frame")
+            except AppError as error:
+                logger.error("browser frame capture failed for %s: %s", id, error.message)
+                return json_response({"id": session["id"], "error": "A képernyő nem érhető el."}, 502)
             return json_response({**result, "id": session["id"], "control_mode": session["control_mode"], "status": session["status"]})
         except AppError as error:
             return browser_error(error.message, error.status_code)
@@ -412,12 +453,12 @@ def app(config: Settings) -> FastAPI:
                     return browser_error("Túl sok kérés. Próbáld újra később.", 429, {"Retry-After": str(retry)})
                 input_data = browser_input(raw["input"])
                 requested_sequence = raw.get("seq")
-                if requested_sequence is not None and (not isinstance(requested_sequence, int) or requested_sequence < 0):
+                if requested_sequence is not None and (not isinstance(requested_sequence, int) or isinstance(requested_sequence, bool) or requested_sequence < 0):
                     return browser_error("Érvénytelen bevitel.", 400)
                 async with browser_state.lock(session_id):
                     sequence = browser_state.sequence(session_id, requested_sequence)
                     if sequence is None:
-                        return browser_error("Elavult vagy ismételt bevitel.", 409)
+                        return json_response({"error": "Elavult vagy ismételt bevitel.", "lastSeq": browser_state.sequences.get(session_id, 0)}, 409)
                     session = await load_session(session_id)
                     if session["status"] != "active":
                         return browser_error("A böngésző már leállt.", 409)
@@ -425,7 +466,11 @@ def app(config: Settings) -> FastAPI:
                         return browser_error("Előbb vedd át az irányítást.", 409)
                     if not viewport_valid(input_data, session["viewport_width"], session["viewport_height"]):
                         return browser_error("Érvénytelen bevitel.", 400)
-                    result = await browser_command(session["cdp_url"], "input", input_data)
+                    try:
+                        result = await browser_command(session["cdp_url"], "input", input_data)
+                    except AppError as error:
+                        logger.error("browser input dispatch failed for %s: %s", session_id, error.message)
+                        return browser_error("A bevitel sikertelen.", 502)
                     return json_response({"ok": True, "seq": sequence, "result": result})
             mode = raw.get("mode")
             if mode not in {"human", "agent"}:
@@ -471,7 +516,6 @@ def app(config: Settings) -> FastAPI:
 
     public_dir = Path(config.public_dir)
     if public_dir.is_dir():
-        from fastapi.staticfiles import StaticFiles
         instance.mount("/", StaticFiles(directory=str(public_dir), html=True), name="public")
 
     return instance

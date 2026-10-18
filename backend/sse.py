@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import codecs
+import json
 from collections.abc import AsyncIterator
 
 from .errors import AppError
@@ -57,6 +58,6 @@ async def sse_data(chunks: AsyncIterator[bytes], limit: int = 1048576) -> AsyncI
         await chunks.aclose()
 
 
-def event_frame(payload: dict, event_id: int | None = None) -> bytes:
+def event_frame(payload: dict[str, object], event_id: int | None = None) -> bytes:
     prefix = f"id: {event_id}\n" if event_id is not None else ""
-    return f"{prefix}data: {__import__('json').dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n".encode("utf-8")
+    return f"{prefix}data: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n".encode("utf-8")

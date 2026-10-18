@@ -476,12 +476,12 @@ async def apply_policy_delta(db: Supabase, ngram: str, delta: float) -> None:
         current = await db.admin_single("agent_policy_weights", "ngram,weight,observations", [eq("ngram", ngram)])
         if current is None:
             try:
-                await db.admin_insert("agent_policy_weights", {"ngram": ngram, "weight": delta, "observations": 1})
+                await db.admin_insert("agent_policy_weights", {"ngram": ngram, "weight": delta, "observations": 1, "updated_at": utc_now()})
                 return
             except AppError:
                 continue
         observations = int(current["observations"])
-        updated = await db.admin_update("agent_policy_weights", {"weight": float(current["weight"]) + delta, "observations": observations + 1}, [eq("ngram", ngram), eq("observations", observations)], "ngram")
+        updated = await db.admin_update("agent_policy_weights", {"weight": float(current["weight"]) + delta, "observations": observations + 1, "updated_at": utc_now()}, [eq("ngram", ngram), eq("observations", observations)], "ngram")
         if updated:
             return
     raise AppError("LEARNING_CONFLICT", f"A politikasúly frissítése sikertelen: {ngram}", 503)
@@ -588,9 +588,18 @@ async def synthesize_skills(db: Supabase, think: Think, log: Callable[[str], Awa
         centroid = embed(" ".join(f"{item.get('component', '')} {item.get('root_cause', '')}" for item in group))
         if any(cosine(vector, centroid) >= 0.8 for vector in vectors):
             continue
-        system = "Meta-ágens vagy: a visszatérő hibamintából újrahasznosítható képességet szintetizálsz SKILL DSL nyelven. Csak DSL-t adj. Kötelező sorok: SKILL, WHEN, REQUIRE, STEP, VERIFY, RECOVER."
+        system = "\n".join((
+            "Meta-ágens vagy: a visszatérő hibamintából újrahasznosítható képességet szintetizálsz SKILL DSL nyelven. Csak a DSL-t add vissza.",
+            "Kötelező formátum, minden záradék külön sorban:",
+            "SKILL <rövid_snake_case_név>",
+            "WHEN <alkalmazási feltétel>",
+            "REQUIRE <előfeltétel>",
+            "STEP <lépés> (több STEP sor is lehet)",
+            "VERIFY <ellenőrizhető sikerfeltétel>",
+            "RECOVER <helyreállítási lépés hiba esetén>",
+        ))
         prompt = "\n---\n".join(f"KOMPONENS: {item.get('component', '')}\nGYÖKÉROK: {item.get('root_cause', '')}\nKORREKCIÓ: {item.get('pivot_action', '')}\nJAVÍTÁS: {item.get('patch', '')}" for item in group)
-        dsl = (await think(system, prompt)).replace("```dsl", "").replace("```", "").strip()
+        dsl = re.sub(r"```[a-z]*\n?|```", "", await think(system, prompt), flags=re.IGNORECASE).strip()
         if not valid_dsl(dsl):
             await log("A szintetizált képesség érvénytelen DSL-t adott, elvetve.")
             continue
@@ -616,10 +625,9 @@ async def consolidate(db: Supabase, think: Think, input_data: dict[str, Any], lo
     async with DB_LOCK:
         if reflections:
             await synthesize_skills(db, think, log)
-        tasks = await db.admin_select("agent_tasks", "id", limit=100000)
-        playbooks = await db.admin_select("agent_playbooks", "task_count,content", order="created_at.desc", limit=1)
-        last_count = int(playbooks[0]["task_count"]) if playbooks else 0
-        if len(tasks) - last_count < 5:
+        total, latest = await asyncio.gather(db.admin_count("agent_tasks"), db.admin_select("agent_playbooks", "task_count,content", order="created_at.desc", limit=1))
+        last_count = int(latest[0]["task_count"]) if latest else 0
+        if total - last_count < 5:
             return
         reflections_rows, skills_rows = await asyncio.gather(
             db.admin_select("agent_reflections", "component,root_cause,pivot_action", order="created_at.desc", limit=40),
@@ -627,11 +635,19 @@ async def consolidate(db: Supabase, think: Think, input_data: dict[str, Any], lo
         )
         prompt = "\n".join(f"- [{row['component']}] {row['root_cause']} => {row['pivot_action']}" for row in reflections_rows)
         known = "\n\n".join(str(row["dsl"]) for row in skills_rows)
-        previous = str(playbooks[0]["content"]) if playbooks else "nincs"
+        previous = str(latest[0]["content"]) if latest else "nincs"
         content = (await think("Tapasztalati tudáskonszolidátor vagy. Írj tömör, magyar működési kézikönyvet két szakasszal: Bevált eljárások és Elkerülendő anti-patternek. Legfeljebb 40 pont.", f"ELŐZŐ KÉZIKÖNYV:\n{previous}\n\nREFLEXIÓK:\n{prompt}\n\nAKTÍV KÉPESSÉGEK:\n{known}")).strip()
-        if content:
-            await db.admin_insert("agent_playbooks", {"content": clip(content, 20000), "task_count": len(tasks)}, "minimal")
-            await log("A működési kézikönyv frissült.")
+        if not content:
+            return
+        inserted = await db.admin_insert("agent_playbooks", {"content": clip(content, 20000), "task_count": total})
+        own_id = inserted[0].get("id") if inserted else None
+        if own_id is not None:
+            first = await db.admin_select("agent_playbooks", "id", [eq("task_count", total)], order="created_at.asc,id.asc", limit=1)
+            oldest = first[0].get("id") if first else None
+            if oldest is not None and str(oldest) != str(own_id):
+                await db.admin_delete("agent_playbooks", [eq("id", str(own_id))])
+                return
+        await log("A működési kézikönyv frissült.")
 
 
 @dataclass(slots=True)

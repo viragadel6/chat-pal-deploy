@@ -4,41 +4,16 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .errors import AppError
+
+MAX_TEXT_LENGTH = 400000
+MAX_HISTORY_LENGTH = 300
+
 
 class ChatMessage(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=False)
     role: Literal["user", "assistant"]
-    content: str = Field(min_length=1, max_length=400000)
-
-
-class ChatRequest(BaseModel):
-    model_config = ConfigDict(extra="ignore")
-    conversation_id: str | None = Field(default=None, max_length=36)
-    messages: list[ChatMessage] = Field(min_length=1, max_length=300)
-
-
-class ToolCall(BaseModel):
-    id: str
-    type: Literal["function"] = "function"
-    function: dict[str, str]
-
-
-class AgentEvent(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    type: str
-    task_id: str
-    step: int | None = None
-    content: str | None = None
-    reasoning_content: str | None = None
-    event: dict[str, Any] | None = None
-    code: str | None = None
-    message: str | None = None
-    outcome: str | None = None
-    reason: str | None = None
-    steps: int | None = None
-    tool_calls: int | None = None
-    duration_ms: int | None = None
-    elapsed_ms: int | None = None
+    content: str = Field(min_length=1, max_length=MAX_TEXT_LENGTH)
 
 
 class BrowserMouseInput(BaseModel):
@@ -73,3 +48,31 @@ class BrowserKeyInput(BaseModel):
 class BrowserTextInput(BaseModel):
     kind: Literal["text"]
     text: str = Field(min_length=1, max_length=10000)
+
+
+def invalid(message: str) -> AppError:
+    return AppError("INVALID_REQUEST", message, 400)
+
+
+def validate_history(payload: Any) -> list[ChatMessage]:
+    if not isinstance(payload, dict):
+        raise invalid("Hiányzó vagy hibás üzenetlista.")
+    raw_messages = payload.get("messages")
+    if not isinstance(raw_messages, list) or not 1 <= len(raw_messages) <= MAX_HISTORY_LENGTH:
+        raise invalid("Hiányzó vagy hibás üzenetlista.")
+    messages: list[ChatMessage] = []
+    for item in raw_messages:
+        if not isinstance(item, dict):
+            raise invalid("Az üzenet szerepköre nem megengedett.")
+        role = item.get("role")
+        if not isinstance(role, str) or role not in ("user", "assistant"):
+            raise invalid("Az üzenet szerepköre nem megengedett.")
+        if any(key not in ("role", "content") for key in item):
+            raise invalid("Kliens oldali utasítás- vagy eszköztörténet nem fogadható el.")
+        content = item.get("content")
+        if not isinstance(content, str) or len(content) > MAX_TEXT_LENGTH or not content.strip():
+            raise invalid("Az üzenet tartalma hibás vagy túl nagy.")
+        messages.append(ChatMessage(role=role, content=content))
+    if messages[-1].role != "user":
+        raise invalid("A legutolsó üzenetnek felhasználói feladatnak kell lennie.")
+    return messages

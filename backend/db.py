@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlencode
 
 import httpx
 
@@ -171,6 +169,16 @@ class Supabase:
             return []
         parsed = response.json()
         return parsed if isinstance(parsed, list) else [parsed]
+
+    async def admin_count(self, table: str, filters: list[tuple[str, str, str]] | None = None) -> int:
+        params: list[tuple[str, str]] = [("select", "id")]
+        for column, operator, value in filters or []:
+            params.append((column, f"{operator}.{value}"))
+        response = await self._request("HEAD", f"/rest/v1/{table}", params=params, headers={"Range": "0-0", "Range-Unit": "items", "Prefer": "count=exact"})
+        value = response.headers.get("content-range", "").rpartition("/")[2]
+        if not value.isdigit():
+            raise AppError("DATABASE_PROTOCOL", "Az adatbázis nem adta meg a sorok számát.", 502)
+        return int(value)
 
     async def admin_delete(self, table: str, filters: list[tuple[str, str, str]], select: str | None = None) -> list[dict[str, Any]]:
         params: list[tuple[str, str]] = []
